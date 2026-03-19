@@ -1,32 +1,33 @@
 mod pdk;
+mod types;
 
-use crate::pdk::types::*;
+use crate::{
+    pdk::{http::http_request_with_retry, types::*},
+    types::*,
+};
 use anyhow::{Result, anyhow};
 use extism_pdk::*;
 use htmd::HtmlToMarkdown;
-use serde_json::json;
-use std::collections::BTreeMap;
+use schemars::schema_for;
+use serde_json::Value;
 
 fn fetch(input: CallToolRequest) -> Result<CallToolResult> {
-    let args = input.request.arguments.unwrap_or_default();
-    let url = args
-        .get("url")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("Please provide a url"))?;
+    let args: FetchArguments =
+        match serde_json::from_value(Value::Object(input.request.arguments.unwrap_or_default())) {
+            Ok(a) => a,
+            Err(e) => return Ok(CallToolResult::error(format!("Invalid arguments: {e}"))),
+        };
 
     // Create HTTP request
-    let mut req = HttpRequest {
-        url: url.to_string(),
-        headers: BTreeMap::new(),
-        method: Some("GET".to_string()),
-    };
-
-    // Add a user agent header to be polite
-    req.headers
-        .insert("User-Agent".to_string(), "fetch-tool/1.0".to_string());
+    let req = HttpRequest::new(args.url)
+        .with_header("User-Agent", "fetch-tool/1.0")
+        .with_method("GET");
 
     // Perform the request
-    let res = http::request::<()>(&req, None)?;
+    let res = match http_request_with_retry(&req) {
+        Ok(res) => res,
+        Err(e) => return Ok(CallToolResult::error(format!("Failed to get HTML: {e}"))),
+    };
 
     // Convert response body to string
     let body = res.body();
@@ -37,20 +38,17 @@ fn fetch(input: CallToolRequest) -> Result<CallToolResult> {
         .build();
 
     // Convert HTML to markdown
-    match converter.convert(&html) {
-        Ok(markdown) => Ok(CallToolResult {
+    Ok(match converter.convert(&html) {
+        Ok(markdown) => CallToolResult {
             content: vec![ContentBlock::Text(TextContent {
                 text: markdown,
 
                 ..Default::default()
             })],
             ..Default::default()
-        }),
-        Err(e) => Ok(CallToolResult::error(format!(
-            "Failed to convert HTML to markdown: {}",
-            e
-        ))),
-    }
+        },
+        Err(e) => CallToolResult::error(format!("Failed to convert HTML to markdown: {e}")),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -58,31 +56,22 @@ fn fetch(input: CallToolRequest) -> Result<CallToolResult> {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn list_tools(_input: ListToolsRequest) -> Result<ListToolsResult> {
-    let input_schema: schemars::Schema = serde_json::from_value(json!({
-        "type": "object",
-        "properties": {
-            "url": {
-                "type": "string",
-                "description": "The URL to fetch",
-            },
-        },
-        "required": ["url"],
-    }))?;
-
     Ok(ListToolsResult {
         tools: vec![Tool {
             name: "fetch".into(),
             description: Some(
-                "Enables to open and access arbitrary text URLs. Fetches the contents of a URL and returns its contents converted to markdown".into(),
+                "Fetches the contents of a URL and returns its contents converted to markdown"
+                    .into(),
             ),
-            input_schema,
+            input_schema: schema_for!(FetchArguments),
             annotations: Some(ToolAnnotations {
                 read_only_hint: Some(true),
                 open_world_hint: Some(true),
                 ..Default::default()
             }),
-            output_schema: None,
             title: Some("Fetch URL".into()),
+
+            ..Default::default()
         }],
     })
 }
